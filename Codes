@@ -1,0 +1,380 @@
+Spatial GRAPH analysis of H&E nuclei  (QuPath centroid exports)
+
+## ---- packages --------------------------------------------------------------
+# install.packages(c("data.table","FNN","igraph","deldir","ggplot2","dplyr","tidyr"))
+suppressPackageStartupMessages({
+  library(data.table)
+  library(FNN)       # fast kNN
+  library(igraph)    # graph metrics
+  library(deldir)    # Delaunay (only needed if GRAPH_TYPE == "delaunay")
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+set.seed(1)
+
+## ---- configuration ---------------------------------------------------------
+data_dir   <- "/Users/mac/Desktop/itegrinmetprev/image analysis/SG"
+out_dir    <- "results_graph"
+GRAPH_TYPE <- "radius"  # "knn" | "delaunay" | "radius"  -- radius makes degree a real biological variable
+K          <- 6         # neighbours, used when GRAPH_TYPE == "knn"
+RADIUS_UM  <- 30        # µm, used when GRAPH_TYPE == "radius"
+MAX_EDGE_UM <- 30       # µm, used when GRAPH_TYPE == "delaunay": prune edges longer
+# than this so Delaunay edges don't bridge tissue voids.
+# Set to Inf to keep the raw (unpruned) triangulation.
+PLOT_GRAPHS <- TRUE     # draw the graph for each image (can be slow on big images)
+
+# Focused pairwise contrast 
+PAIR_CONTRAST <- c("Day 14", "Day 14 metformin")
+
+dir.create(out_dir, showWarnings = FALSE)
+dir.create(file.path(out_dir, "figures"), showWarnings = FALSE)
+
+# Figure saver
+save_fig <- function(filename, plot, ...) {
+  path <- file.path(out_dir, "figures", filename)
+  ok <- tryCatch({ ggsave(path, plot, ...); TRUE },
+                 error = function(e) { message("  [FIG FAILED] ", filename, ": ",
+                                               conditionMessage(e)); FALSE })
+  if (ok) cat("  saved:", normalizePath(path), "\n")
+  invisible(ok)
+}
+
+condition_levels <- c("Day 0","Day 14","Day 14 metformin","Day 21","Day 21 metformin")
+stem_to_condition <- function(stem) dplyr::recode(stem,
+                                                  "day0"="Day 0","day14"="Day 14","day14met"="Day 14 metformin",
+                                                  "day21"="Day 21","day21met"="Day 21 metformin", .default = stem)
+
+## ---- column detection ----------------------------------------------
+find_col <- function(nms, patterns){
+  for (p in patterns){ h <- grep(p, nms, ignore.case=TRUE, value=TRUE)
+  if (length(h)) return(h[1]) }
+  stop("No column matching: ", paste(patterns, collapse=" | "))
+}
+
+## ---- load one file ---------------------------------------------------------
+read_one <- function(f){
+  dt  <- data.table::fread(f, sep="\t", showProgress=FALSE)
+  nms <- names(dt)
+  xc  <- find_col(nms, c("^Centroid.?X","Centroid X"))
+  yc  <- find_col(nms, c("^Centroid.?Y","Centroid Y"))
+  stem  <- sub("\\.txt$","",basename(f))
+  parts <- strsplit(stem,"_")[[1]]
+  data.table(
+    file=stem, condition=stem_to_condition(paste(parts[-length(parts)],collapse="_")),
+    replicate=parts[length(parts)],
+    x=as.numeric(dt[[xc]]), y=as.numeric(dt[[yc]])
+  )[is.finite(x)&is.finite(y)]
+}
+
+files <- list.files(data_dir, pattern="\\.txt$", full.names=TRUE)
+stopifnot(length(files)>0)
+cells <- rbindlist(lapply(files, read_one))
+cells[, condition := factor(condition, levels=condition_levels)]
+cat(sprintf("Loaded %d nuclei across %d images.\n", nrow(cells), cells[,uniqueN(file)]))
+
+## ---- graph builders --------------------------------------------------------
+build_graph <- function(co, type=GRAPH_TYPE, k=K, radius=RADIUS_UM){
+  n <- nrow(co)
+  if (type == "knn"){
+    knn <- FNN::get.knn(co, k=k)
+    ei  <- rep(seq_len(n), each=k)
+    ej  <- as.vector(t(knn$nn.index))
+    w   <- as.vector(t(knn$nn.dist))
+    g   <- igraph::graph_from_edgelist(cbind(ei,ej), directed=FALSE)
+    igraph::E(g)$weight <- w
+    g   <- igraph::simplify(g, edge.attr.comb="first")
+    
+  } else if (type == "radius"){
+    # neighbours within radius: over-fetch kNN, then keep pairs within radius.
+    kk  <- min(n - 1, 50)
+    knn <- FNN::get.knn(co, k = kk)
+    within <- knn$nn.dist <= radius            # logical matrix, n x kk
+    # guard: if any nucleus has ALL kk fetched neighbours within radius, its
+    # true degree may exceed kk and be truncated. Warn so it's never silent.
+    if (any(rowSums(within) == kk) && kk < (n - 1))
+      warning(sprintf("radius graph: %d nuclei may exceed the k=%d neighbour cap at r=%g; increase kk.",
+                      sum(rowSums(within) == kk), kk, radius))
+    src <- row(within)[within]                 # source node index
+    nbr <- knn$nn.index[within]                # neighbour node index (aligned)
+    w   <- knn$nn.dist[within]                 # edge length
+    # build on a FIXED vertex set of size n so isolated nuclei are retained
+    g   <- igraph::make_empty_graph(n = n, directed = FALSE)
+    if (length(src)) {
+      g <- igraph::add_edges(g, rbind(src, nbr), weight = w)
+      g <- igraph::simplify(g, edge.attr.comb = "first")  # drops duplicate i-j / j-i
+    }
+    
+  } else if (type == "delaunay"){
+    dd  <- deldir::deldir(co[,1], co[,2], suppressMsge=TRUE)
+    el  <- as.matrix(dd$delsgs[, c("ind1","ind2")])
+    len <- sqrt((co[el[,1],1]-co[el[,2],1])^2 + (co[el[,1],2]-co[el[,2],2])^2)
+    keep <- len <= MAX_EDGE_UM               # prune void-bridging edges
+    el   <- el[keep, , drop=FALSE]; len <- len[keep]
+    # build on a FIXED vertex set of size n so pruning-isolated nuclei survive
+    g   <- igraph::make_empty_graph(n = n, directed = FALSE)
+    if (nrow(el)) {
+      g <- igraph::add_edges(g, as.vector(t(el)), weight = len)
+      g <- igraph::simplify(g, edge.attr.comb = "first")
+    }
+  } else stop("Unknown GRAPH_TYPE")
+  
+  igraph::V(g)$x <- co[,1]; igraph::V(g)$y <- co[,2]
+  g
+}
+
+## ---- per-image graph metrics ----------------------------------------------
+graph_metrics <- function(df){
+  co <- as.matrix(df[,.(x,y)])
+  g  <- build_graph(co)
+  deg <- igraph::degree(g)
+  comp <- igraph::components(g)
+  
+  # --- density & nearest-neighbour distance (independent of graph choice) ---
+  # tissue area from the convex hull (µm^2 -> mm^2); hull hugs irregular tissue
+  # far better than a bounding box.
+  hull_area_mm2 <- tryCatch({
+    ch <- grDevices::chull(co); poly <- co[c(ch, ch[1]), ]
+    abs(sum(poly[-nrow(poly),1]*poly[-1,2] - poly[-1,1]*poly[-nrow(poly),2]))/2/1e6
+  }, error=function(e) NA_real_)
+  # nearest-neighbour distance via FNN (k=1)
+  nnd <- FNN::get.knn(co, k=1)$nn.dist[,1]
+  
+  data.table(
+    file           = df$file[1],
+    condition      = df$condition[1],
+    replicate      = df$replicate[1],
+    n_nodes        = igraph::vcount(g),
+    n_edges        = igraph::ecount(g),
+    density_per_mm2 = nrow(co) / hull_area_mm2,
+    mean_nnd_um    = mean(nnd),
+    mean_degree    = mean(deg),
+    sd_degree      = sd(deg),
+    graph_density  = igraph::edge_density(g),
+    transitivity   = igraph::transitivity(g, type="global"),  # clustering coeff
+    mean_local_cc  = mean(igraph::transitivity(g, type="local"), na.rm=TRUE),
+    mean_edge_len  = mean(igraph::E(g)$weight),
+    assortativity  = suppressWarnings(igraph::assortativity_degree(g)),
+    n_components   = comp$no,
+    frac_largest   = max(comp$csize)/igraph::vcount(g),
+    mean_path_len  = tryCatch(igraph::mean_distance(g, directed=FALSE),
+                              error=function(e) NA_real_)
+  )
+}
+
+gm <- rbindlist(lapply(split(cells, by="file"), graph_metrics))
+gm[, condition := factor(condition, levels=condition_levels)]
+setorder(gm, condition, replicate)
+data.table::fwrite(gm, file.path(out_dir, "graph_metrics_per_image.csv"))
+cat("\n==== GRAPH METRICS PER IMAGE (", GRAPH_TYPE, ") ====\n", sep="")
+print(gm[, .(file, condition, mean_degree=round(mean_degree,2),
+             graph_density=signif(graph_density,3),
+             transitivity=round(transitivity,3),
+             mean_edge_len=round(mean_edge_len,2),
+             frac_largest=round(frac_largest,3))])
+
+## ---- condition-level summary + exploratory tests (n = 3) -------------------
+metrics <- c("mean_degree","graph_density","transitivity","mean_local_cc",
+             "mean_edge_len","assortativity","frac_largest","mean_path_len")
+
+summ <- gm %>% select(condition, all_of(metrics)) %>%
+  pivot_longer(-condition, names_to="metric", values_to="value") %>%
+  group_by(metric, condition) %>%
+  summarise(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE),
+            n=dplyr::n(), .groups="drop")
+data.table::fwrite(summ, file.path(out_dir, "graph_summary_by_condition.csv"))
+
+tests <- rbindlist(lapply(metrics, function(m){
+  d <- gm[, .(condition, value=get(m))]
+  data.table(metric=m,
+             kruskal_p = tryCatch(kruskal.test(value~condition,d)$p.value, error=function(e) NA),
+             anova_p   = tryCatch(summary(aov(value~condition,d))[[1]][["Pr(>F)"]][1],
+                                  error=function(e) NA))
+}))
+data.table::fwrite(tests, file.path(out_dir, "graph_omnibus_tests.csv"))
+cat("\n==== OMNIBUS TESTS (n = 3 per condition; exploratory) ====\n")
+print(tests)
+
+## ---- focused pairwise contrast --------
+# report Welch's t (primary, exact for
+# small n) plus Cohen's d effect size. 
+if (!is.null(PAIR_CONTRAST)) {
+  cohens_d <- function(a, b) (mean(b)-mean(a)) /
+    sqrt(((length(a)-1)*var(a) + (length(b)-1)*var(b)) / (length(a)+length(b)-2))
+  pair_tests <- rbindlist(lapply(metrics, function(m){
+    a <- gm[condition==PAIR_CONTRAST[1], get(m)]
+    b <- gm[condition==PAIR_CONTRAST[2], get(m)]
+    tt <- tryCatch(t.test(a, b), error=function(e) list(p.value=NA))
+    data.table(metric=m,
+               grp1_mean=mean(a), grp2_mean=mean(b),
+               diff=mean(b)-mean(a),
+               welch_t_p=tt$p.value,
+               cohens_d=tryCatch(cohens_d(a,b), error=function(e) NA))
+  }))
+  data.table::fwrite(pair_tests, file.path(out_dir, "graph_pairwise_contrast.csv"))
+  cat(sprintf("\n==== FOCUSED CONTRAST: %s  vs  %s ====\n",
+              PAIR_CONTRAST[1], PAIR_CONTRAST[2]))
+  print(pair_tests[, .(metric,
+                       g1=round(grp1_mean,3), g2=round(grp2_mean,3),
+                       diff=round(diff,3),
+                       welch_p=round(welch_t_p,4),
+                       cohens_d=round(cohens_d,2))])
+}
+
+## ---- density: full significance analysis -----------------------------------
+# Density (nuclei/mm²). We report the 5-way omnibus
+# AND all pairwise Welch contrasts, on raw and log scale (log stabilises the
+# variance, which grows with the mean here).
+dens_omni <- data.table(
+  scale   = c("raw","log"),
+  anova_p = c(summary(aov(density_per_mm2 ~ condition, gm))[[1]][["Pr(>F)"]][1],
+              summary(aov(log(density_per_mm2) ~ condition, gm))[[1]][["Pr(>F)"]][1]),
+  kruskal_p = c(kruskal.test(density_per_mm2 ~ condition, gm)$p.value,
+                kruskal.test(log(density_per_mm2) ~ condition, gm)$p.value))
+cat("\n==== DENSITY omnibus (5 groups) ====\n"); print(dens_omni)
+
+pairs_all <- t(combn(levels(gm$condition), 2))
+dens_pw <- rbindlist(lapply(seq_len(nrow(pairs_all)), function(i){
+  a <- gm[condition==pairs_all[i,1], density_per_mm2]
+  b <- gm[condition==pairs_all[i,2], density_per_mm2]
+  data.table(
+    group1=pairs_all[i,1], group2=pairs_all[i,2],
+    mean1=mean(a), mean2=mean(b),
+    welch_p_raw = t.test(a,b)$p.value,
+    welch_p_log = t.test(log(a),log(b))$p.value)
+}))
+dens_pw[, `:=`(sig_raw = welch_p_raw < 0.05,
+               bonferroni_p_raw = pmin(1, welch_p_raw * .N))]
+data.table::fwrite(dens_pw, file.path(out_dir, "density_pairwise_tests.csv"))
+cat("\n==== DENSITY pairwise (Welch t) ====\n")
+print(dens_pw[, .(group1, group2,
+                  mean1=round(mean1), mean2=round(mean2),
+                  welch_p_raw=round(welch_p_raw,4),
+                  welch_p_log=round(welch_p_log,4),
+                  bonferroni_raw=round(bonferroni_p_raw,3),
+                  sig=sig_raw)])
+cat("NOTE: 'sig' is uncorrected. With 10 pairwise tests, treat an uncorrected\n",
+    "p<0.05 as confirmatory ONLY if it was an a priori planned contrast;\n",
+    "otherwise see the Bonferroni column.\n", sep="")
+
+## ---- distance-to-baseline (Day 0) analysis ---------------------------------
+# Does metformin move tissue toward or away from the Day 0 baseline?
+# Metrics are z-scored across images so they are comparable, then each
+# condition's centroid distance to the Day 0 centroid is computed.
+baseline <- "Day 0"
+dist_metrics <- c("density_per_mm2","mean_nnd_um","mean_degree","transitivity")
+
+Z <- copy(gm)
+for (m in dist_metrics)
+  Z[[m]] <- (gm[[m]] - mean(gm[[m]], na.rm=TRUE)) / sd(gm[[m]], na.rm=TRUE)
+cen <- Z[, lapply(.SD, mean, na.rm=TRUE), by=condition, .SDcols=dist_metrics]
+# unlist() coerces the 1-row data.table to a plain numeric vector.
+# (as.numeric() on a data.table errors: "(list) object cannot be coerced".)
+base_vec <- unlist(cen[condition==baseline, ..dist_metrics], use.names=FALSE)
+cen[, dist_to_baseline :=
+      sqrt(rowSums((as.matrix(.SD) - matrix(base_vec, .N, length(base_vec),
+                                            byrow=TRUE))^2)),
+    .SDcols=dist_metrics]
+setorder(cen, dist_to_baseline)
+data.table::fwrite(cen, file.path(out_dir, "distance_to_baseline.csv"))
+cat(sprintf("\n==== MULTIVARIATE DISTANCE TO %s (z-scored: %s) ====\n",
+            baseline, paste(dist_metrics, collapse=", ")))
+print(cen[, .(condition, dist_to_baseline=round(dist_to_baseline,3))])
+
+# per-metric raw means for each condition
+permetric <- gm[, lapply(.SD, function(x) round(mean(x, na.rm=TRUE), 3)),
+                by=condition, .SDcols=dist_metrics]
+cat("\n==== PER-METRIC condition means (raw) ====\n")
+print(permetric)
+
+# plot: distance to baseline
+p_dist <- ggplot(cen, aes(reorder(condition, dist_to_baseline), dist_to_baseline,
+                          fill=condition)) +
+  geom_col(alpha=.6, width=.65) +
+  geom_text(aes(label=round(dist_to_baseline,2)), vjust=-0.4, size=3.5) +
+  labs(x=NULL, y=sprintf("Distance to %s (standardized)", baseline),
+       title="How far each condition sits from baseline",
+       subtitle=paste("z-scored metrics:", paste(dist_metrics, collapse=", "))) +
+  theme_bw(11) +
+  theme(axis.text.x=element_text(angle=25,hjust=1), legend.position="none")
+save_fig("g5_distance_to_baseline.png", p_dist, width=7.5, height=5, dpi=200)
+
+# plot: density with the significant Day0-vs-Day21 contrast in view
+p_densfig <- ggplot(gm, aes(condition, density_per_mm2, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=.5) +
+  geom_jitter(width=.12, size=2.4) +
+  labs(x=NULL, y="Nuclear density (per mm²)",
+       title="Nuclear density by condition",
+       subtitle="Hull-based area; n = 3 images per condition") +
+  theme_bw(11) +
+  theme(axis.text.x=element_text(angle=25,hjust=1), legend.position="none")
+save_fig("g6_density.png", p_densfig, width=7.5, height=5, dpi=200)
+
+
+## ---- boxplots of key graph metrics ----------------------------------------
+plot_metric <- function(m, lab){
+  ggplot(gm, aes(condition, .data[[m]], fill=condition)) +
+    geom_boxplot(outlier.shape=NA, alpha=.5) +
+    geom_jitter(width=.12, size=2) +
+    labs(x=NULL, y=lab, title=lab) + theme_bw(10) +
+    theme(axis.text.x=element_text(angle=25,hjust=1), legend.position="none")
+}
+save_fig("g1_mean_degree.png", plot_metric("mean_degree","Mean degree"), width=7,height=5,dpi=150)
+save_fig("g2_transitivity.png", plot_metric("transitivity","Clustering coefficient (global transitivity)"), width=7,height=5,dpi=150)
+save_fig("g3_edge_len.png", plot_metric("mean_edge_len","Mean edge length (µm)"), width=7,height=5,dpi=150)
+save_fig("g4_graph_density.png", plot_metric("graph_density","Graph density"), width=7,height=5,dpi=150)
+
+## ---- clean mean_degree figure (the headline metric) ------------------------
+# Per-image points + condition mean ± SE. mean_degree is the one clearly
+# biological graph metric (tracks local nuclear packing), so it gets a
+# dedicated figure. graph_density is intentionally NOT shown as a result:
+# in radius/kNN graphs it is mechanically mean_degree/(n-1), an n-confound.
+deg_summ <- gm[, .(mean = mean(mean_degree),
+                   se   = sd(mean_degree)/sqrt(.N)), by = condition]
+p_deg <- ggplot() +
+  geom_col(data = deg_summ, aes(condition, mean, fill = condition),
+           alpha = .35, width = .65) +
+  geom_errorbar(data = deg_summ,
+                aes(condition, ymin = mean-se, ymax = mean+se), width = .18) +
+  geom_jitter(data = gm, aes(condition, mean_degree),
+              width = .10, size = 2.4) +
+  labs(x = NULL, y = "Mean degree (neighbours)",
+       title = "Local nuclear connectivity",
+       subtitle = sprintf("%s graph; per-image points, bars = mean ± SE (n = 3)",
+                          GRAPH_TYPE)) +
+  theme_bw(11) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "none")
+save_fig("g0_mean_degree_MAIN.png", p_deg, width = 7.5, height = 5, dpi = 200)
+
+## ---- draw each spatial graph ----------------------------------------------
+# Nodes at real coordinates, edges as segments. Big images are dense, so this
+# is mainly a visual sanity check of the connectivity structure.
+if (PLOT_GRAPHS){
+  draw_one <- function(df){
+    co <- as.matrix(df[,.(x,y)])
+    g  <- build_graph(co)
+    el <- igraph::as_edgelist(g)
+    edges <- data.table(x=co[el[,1],1], y=co[el[,1],2],
+                        xend=co[el[,2],1], yend=co[el[,2],2])
+    ggplot() +
+      geom_segment(data=edges, aes(x,y,xend=xend,yend=yend),
+                   linewidth=0.05, colour="steelblue", alpha=0.4) +
+      geom_point(data=df, aes(x,y), size=0.15, colour="black") +
+      coord_equal() +
+      labs(title=paste0(df$condition[1]," — ",df$file[1]),
+           x="X (µm)", y="Y (µm)") + theme_bw(9)
+  }
+  for (fl in unique(cells$file)){
+    p <- draw_one(cells[file==fl])
+    save_fig(paste0("graph_",fl,".png"), p, width=6, height=6, dpi=150)
+  }
+}
+
+cat("\n==== DONE ====\n")
+
+
+
+
+
+
