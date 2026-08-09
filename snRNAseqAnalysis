@@ -1,0 +1,537 @@
+# snRNA-seq PSEUDOBULK analysis
+
+suppressPackageStartupMessages({
+  library(Seurat); library(Matrix)
+  library(DESeq2)                       # BiocManager::install("DESeq2")
+  library(dplyr); library(tidyr); library(ggplot2)
+})
+# raises R's vector memory ceiling if the default is low (macOS often 16 GB).
+try(mem.maxVSize(64 * 1024), silent = TRUE)
+
+## ---- config ----------------------------------------------------------------
+obj_path   <- "/Users/mac/Desktop/metprev/ifnb_annotatated23062026.RDs"
+out_dir    <- "/Users/mac/Desktop/itegrinmetprev/image analysis/SG/snRNAseq_results"
+SAMPLE_COL <- "Sample"      # biological replicate column (20 IDs, ~3-4 per condition)
+MIN_CELLS_PER_UNIT <- 10    # drop pseudobulk units (celltype x condition x sample) below this
+MIN_REPS_PER_SIDE  <- 2     # DESeq2 needs >=2 replicates per condition side
+DOWNSAMPLE         <- TRUE  # stratified cap per unit (only acts on oversized units)
+MAX_CELLS_PER_UNIT <- 1500  # cap; set NULL to auto (90th percentile of unit sizes)
+PADJ <- 0.05; LFC <- 1      # significance thresholds (|log2FC| > 1 = 2-fold)
+dir.create(file.path(out_dir, "DE"), showWarnings = FALSE, recursive = TRUE)
+
+## ---- load & tidy -----------------------------------------------------------
+ifnb <- readRDS(obj_path)
+DefaultAssay(ifnb) <- "RNA"
+if (length(Layers(ifnb, search = "data")) > 1) ifnb <- JoinLayers(ifnb)
+ifnb <- RenameIdents(ifnb, "Lymohatic ECs" = "Lymphatic ECs")
+ifnb$celltype <- Idents(ifnb)
+sub_levels <- c("Day0_Control","Day14_Control","Day14_Metformin",
+                "Day21_Control","Day21_Metformin")
+sub_levels <- intersect(sub_levels, unique(ifnb$Subgroup))
+ifnb$Subgroup <- factor(ifnb$Subgroup, levels = sub_levels)
+
+## ---- resolve the biological-replicate column -------------------------------
+if (is.null(SAMPLE_COL)) {
+  cand <- grep("sample|mouse|animal|replicate|hash|orig\\.ident",
+               colnames(ifnb@meta.data), ignore.case = TRUE, value = TRUE)
+  # a real replicate column has >1 distinct ID within at least one condition;
+  # this rejects columns that are 1:1 with Subgroup (e.g. a single "EAM" label).
+  good <- Filter(function(cc){
+    tab <- table(ifnb$Subgroup, ifnb@meta.data[[cc]])
+    max(rowSums(tab > 0)) > 1
+  }, cand)
+  SAMPLE_COL <- if (length(good)) good[1] else NULL
+}
+if (is.null(SAMPLE_COL))
+  stop("No sample/replicate column found. Pseudobulk needs biological replicates. ",
+       "Set SAMPLE_COL manually, or use the cell-level script instead.")
+message("Using replicate column: ", SAMPLE_COL)
+ifnb$sample <- as.character(ifnb@meta.data[[SAMPLE_COL]])
+
+# report replicate structure
+rep_tab <- ifnb@meta.data %>% dplyr::distinct(Subgroup, sample) %>% dplyr::count(Subgroup, name="n_samples")
+write.csv(rep_tab, file.path(out_dir, "replicate_structure.csv"), row.names = FALSE)
+cat("\n== replicates per condition ==\n"); print(rep_tab)
+if (max(rep_tab$n_samples) < MIN_REPS_PER_SIDE)
+  stop("Fewer than ", MIN_REPS_PER_SIDE, " samples in every condition: pseudobulk ",
+       "DE has no replicates to test. Provide replicate info or use cell-level DE.")
+
+## ---- 1. Composition --------------------------------------------------------
+comp <- as.data.frame(prop.table(table(ifnb$celltype, ifnb$Subgroup), margin = 2))
+colnames(comp) <- c("celltype","Subgroup","proportion")
+write.csv(comp, file.path(out_dir, "composition_proportions.csv"), row.names = FALSE)
+ggsave(file.path(out_dir, "fig1_composition.png"),
+       ggplot(comp, aes(Subgroup, proportion, fill = celltype)) + geom_col() +
+         labs(x=NULL, y="Proportion of nuclei", title="Cell-type composition") +
+         theme_bw(11) + theme(axis.text.x = element_text(angle=25, hjust=1)),
+       width = 8, height = 5, dpi = 200)
+
+## ---- 2. Stratified downsampling ---------------------
+md <- ifnb@meta.data
+md$unit <- paste(md$celltype, md$Subgroup, md$sample, sep = "___")
+unit_sizes <- table(md$unit)
+if (DOWNSAMPLE) {
+  cap <- if (is.null(MAX_CELLS_PER_UNIT))
+    ceiling(quantile(unit_sizes, 0.9)) else MAX_CELLS_PER_UNIT
+  set.seed(1)
+  keep <- unlist(lapply(split(rownames(md), md$unit), function(bc)
+    if (length(bc) > cap) sample(bc, cap) else bc), use.names = FALSE)
+  n_before <- nrow(md); ifnb <- subset(ifnb, cells = keep)
+  cat(sprintf("Stratified downsample: cap=%d cells/unit; kept %d of %d cells (%d units capped).\n",
+              cap, length(keep), n_before, sum(unit_sizes > cap)))
+  md <- ifnb@meta.data; md$unit <- paste(md$celltype, md$Subgroup, md$sample, sep="___")
+}
+
+## ---- build pseudobulk count matrix (genes x unit) --------------------------
+counts <- GetAssayData(ifnb, assay = "RNA", layer = "counts")
+if (!inherits(counts, "sparseMatrix")) counts <- methods::as(counts, "CsparseMatrix")
+grp    <- factor(md$unit)
+pb     <- counts %*% t(Matrix::fac2sparse(grp))    # sparse genes x units (stays sparse)
+# NOTE: pb is kept as a sparse Matrix. It is densified per cell type inside
+# fit_dds() (tiny submatrices), never all at once — this avoids the 16 GB blow-up.
+lut    <- md %>% dplyr::distinct(unit, celltype, Subgroup, sample, Group, Treatment)
+lut    <- lut[match(colnames(pb), lut$unit), ]
+lut$ncell <- as.integer(table(grp)[colnames(pb)])
+keep_units <- lut$ncell >= MIN_CELLS_PER_UNIT
+pb     <- pb[, keep_units, drop = FALSE]
+lut    <- lut[keep_units, ]
+write.csv(lut, file.path(out_dir, "pseudobulk_units.csv"), row.names = FALSE)
+
+## ---- 3. Two models: (A) disease/time in controls, (B) time x treatment ------
+# Day0 has no metformin arm, so a single 3x2 interaction model is rank-deficient.
+# We therefore fit two complementary per-cell-type models.
+lut$Group     <- factor(as.character(lut$Group))
+lut$Treatment <- factor(as.character(lut$Treatment))
+cts <- levels(droplevels(factor(lut$celltype)))
+
+fit_dds <- function(m, cd, design){
+  m <- as.matrix(m)                       # small: genes x (few units) only
+  storage.mode(m) <- "integer"            # DESeq2 needs integer counts
+  m <- m[rowSums(m) >= 10, , drop = FALSE]
+  # DESeq2 requires colData rownames to match count colnames exactly.
+  cd <- as.data.frame(cd)
+  rownames(cd) <- cd$unit
+  cd <- cd[colnames(m), , drop = FALSE]   # reorder to match column order
+  dds <- suppressMessages(DESeqDataSetFromMatrix(m, cd, design))
+  tryCatch(suppressMessages(DESeq(dds, quiet = TRUE)), error = function(e) NULL)
+}
+
+## --- Model A: disease/time, CONTROLS only (~ Group, ref = Day0) --------------
+diseaseDE <- list()
+for (ct in cts){
+  sel <- which(lut$celltype==ct & lut$Treatment=="CTR")
+  cd  <- droplevels(lut[sel,]); cd$Group <- factor(cd$Group,
+                                                   levels=c("Day0","Day14","Day21"))
+  if (any(table(cd$Group) < MIN_REPS_PER_SIDE) || nlevels(cd$Group) < 2) next
+  dds <- fit_dds(pb[, sel, drop=FALSE], cd, ~ Group)
+  if (is.null(dds)) next
+  for (cmp in list(c("Day14","Day0"), c("Day21","Day0"))){
+    if (!all(cmp %in% levels(cd$Group))) next
+    r <- as.data.frame(results(dds, contrast=c("Group", cmp[1], cmp[2])))
+    r$gene <- rownames(r); r$celltype <- ct
+    r$contrast <- paste0("disease_", cmp[1], "_vs_", cmp[2])
+    diseaseDE[[paste(ct,cmp[1])]] <- r
+  }
+}
+diseaseDE <- dplyr::bind_rows(diseaseDE)
+
+## --- Model B: time x treatment, Day14 + Day21 (~ Group+Treatment+interaction) -
+# Requires all four Group x Treatment cells present (>= MIN_REPS each).
+metDE <- list()
+for (ct in cts){
+  sel <- which(lut$celltype==ct & lut$Group %in% c("Day14","Day21"))
+  cd  <- droplevels(lut[sel,])
+  cd$Group     <- factor(cd$Group,     levels=c("Day14","Day21"))   # ref Day14
+  cd$Treatment <- factor(cd$Treatment, levels=c("CTR","MET"))       # ref CTR
+  combos <- table(cd$Group, cd$Treatment)
+  if (nrow(combos) < 2 || ncol(combos) < 2 || any(combos < MIN_REPS_PER_SIDE)) next
+  dds <- fit_dds(pb[, sel, drop=FALSE], cd, ~ Group + Treatment + Group:Treatment)
+  if (is.null(dds)) next
+  rn <- resultsNames(dds)
+  nm_met <- grep("^Treatment_MET", rn, value=TRUE)[1]       # metformin @ Day14 (ref)
+  nm_int <- grep("Group.*Treatment", rn, value=TRUE)[1]     # interaction
+  if (is.na(nm_met) || is.na(nm_int)) next
+  add <- function(res, term){ r<-as.data.frame(res); r$gene<-rownames(r)
+  r$celltype<-ct; r$contrast<-term; r }
+  # metformin @ Day14, interaction (key), metformin @ Day21 (main + interaction)
+  metDE[[paste(ct,"d14")]] <- add(results(dds, name=nm_met),               "metformin_at_Day14")
+  metDE[[paste(ct,"int")]] <- add(results(dds, name=nm_int),               "metformin_timeInteraction")
+  metDE[[paste(ct,"d21")]] <- add(results(dds, contrast=list(c(nm_met,nm_int))),"metformin_at_Day21")
+}
+metDE <- dplyr::bind_rows(metDE)
+
+de_all <- dplyr::bind_rows(diseaseDE, metDE)
+for (cn in unique(de_all$contrast))
+  write.csv(dplyr::filter(de_all, contrast==cn),
+            file.path(out_dir, "DE", paste0("DE_", cn, ".csv")), row.names = FALSE)
+
+sig <- de_all %>% dplyr::filter(!is.na(padj), padj < PADJ, abs(log2FoldChange) > LFC) %>%
+  dplyr::count(contrast, celltype, name = "n_sig")
+write.csv(sig, file.path(out_dir, "DE_significant_counts.csv"), row.names = FALSE)
+ggsave(file.path(out_dir, "fig2_DE_summary.png"),
+       ggplot(sig, aes(contrast, celltype, fill = n_sig)) + geom_tile() +
+         geom_text(aes(label = n_sig), size = 3) +
+         scale_fill_viridis_c(option="magma", direction=-1) +
+         labs(x=NULL, y=NULL, title="Molecular programs altered (n significant genes)") +
+         theme_bw(11) + theme(axis.text.x = element_text(angle=25, hjust=1)),
+       width = 9, height = 5, dpi = 200)
+
+# key output: cell types with a significant time-dependent metformin effect
+interaction_hits <- de_all %>%
+  dplyr::filter(contrast=="metformin_timeInteraction", !is.na(padj), padj < PADJ) %>%
+  dplyr::count(celltype, name="n_interaction_genes") %>% dplyr::arrange(desc(n_interaction_genes))
+write.csv(interaction_hits, file.path(out_dir, "metformin_timeInteraction_hits.csv"),
+          row.names = FALSE)
+
+## ---- 4. Metformin reversal (transcriptomic distance-to-baseline) -----------
+# disease genes (Day0 -> Day21, controls), then does metformin @ Day21 push
+# them the OPPOSITE way? opposite sign = reversal toward baseline.
+dis <- de_all %>% dplyr::filter(contrast=="disease_Day21_vs_Day0", !is.na(padj),
+                                padj<PADJ, abs(log2FoldChange)>LFC) %>%
+  dplyr::select(celltype, gene, disease_lfc = log2FoldChange)
+met <- de_all %>% dplyr::filter(contrast=="metformin_at_Day21") %>%
+  dplyr::select(celltype, gene, metformin_lfc = log2FoldChange)
+rev_tab <- dplyr::inner_join(dis, met, by = c("celltype","gene")) %>%
+  dplyr::group_by(celltype) %>%
+  dplyr::summarise(n_disease_genes = dplyr::n(),
+                   pct_reversed = 100*mean(sign(metformin_lfc) != sign(disease_lfc)),
+                   lfc_correlation = suppressWarnings(cor(disease_lfc, metformin_lfc)),
+                   .groups = "drop") %>%
+  dplyr::filter(n_disease_genes >= 10) %>% dplyr::arrange(desc(pct_reversed))
+write.csv(rev_tab, file.path(out_dir, "metformin_reversal_day21.csv"), row.names = FALSE)
+if (nrow(rev_tab))
+  ggsave(file.path(out_dir, "fig3_metformin_reversal.png"),
+         ggplot(rev_tab, aes(reorder(celltype, pct_reversed), pct_reversed, fill = pct_reversed)) +
+           geom_col() + coord_flip() + geom_hline(yintercept = 50, linetype = 2, colour="grey50") +
+           scale_fill_viridis_c() +
+           labs(x=NULL, y="% disease genes reversed by metformin (Day 21)",
+                title="Metformin reversal of disease programs",
+                subtitle="Dashed = 50% (no net reversal)") +
+           theme_bw(11) + theme(legend.position="none"),
+         width = 8, height = 5, dpi = 200)
+
+
+# Plot the top 3 metformin-REVERSED genes, per cell type, at each timepoint
+
+suppressPackageStartupMessages({ library(Matrix); library(dplyr); library(ggplot2) })
+
+stopifnot(exists("de_all"), exists("pb"), exists("lut"))
+fig_dir <- file.path(out_dir, "reversal_gene_plots")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+TOP_N      <- 3
+timepoints <- c("Day14", "Day21")
+
+## ---- normalised pseudobulk expression (log2 CPM per unit) ------------------
+libsize <- Matrix::colSums(pb)
+get_expr <- function(genes){
+  genes <- intersect(genes, rownames(pb))
+  if (!length(genes)) return(NULL)
+  cpm <- sweep(as.matrix(pb[genes, , drop = FALSE]), 2, libsize, "/") * 1e6
+  df  <- as.data.frame(as.table(log2(cpm + 1)))
+  colnames(df) <- c("gene", "unit", "log2cpm")
+  dplyr::left_join(df, lut, by = "unit")
+}
+
+## ---- select top reversed genes per cell type x timepoint -------------------
+pick_top <- function(ct, tp, n = TOP_N){
+  d <- de_all %>% dplyr::filter(celltype == ct,
+                                contrast == paste0("disease_", tp, "_vs_Day0"),
+                                !is.na(padj), padj < PADJ, abs(log2FoldChange) > LFC) %>%
+    dplyr::select(gene, disease_lfc = log2FoldChange, disease_padj = padj)
+  m <- de_all %>% dplyr::filter(celltype == ct,
+                                contrast == paste0("metformin_at_", tp)) %>%
+    dplyr::select(gene, met_lfc = log2FoldChange, met_padj = padj)
+  j <- dplyr::inner_join(d, m, by = "gene") %>%
+    dplyr::mutate(reversal_score = -sign(disease_lfc) * met_lfc) %>%
+    dplyr::filter(reversal_score > 0) %>%
+    dplyr::arrange(dplyr::desc(reversal_score)) %>%
+    utils::head(n)
+  if (nrow(j)) { j$celltype <- ct; j$timepoint <- tp }
+  j
+}
+
+cts_here <- sort(unique(de_all$celltype))
+sel <- dplyr::bind_rows(lapply(cts_here, function(ct)
+  dplyr::bind_rows(lapply(timepoints, pick_top, ct = ct))))
+if (!nrow(sel)) stop("No reversed genes found at the current PADJ/LFC thresholds.")
+write.csv(sel, file.path(out_dir, "reversal_top_genes.csv"), row.names = FALSE)
+
+## ---- one figure per cell type (facets: timepoint x gene) -------------------
+safe <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+for (ct in unique(sel$celltype)){
+  sct <- sel %>% dplyr::filter(celltype == ct)
+  expr <- get_expr(unique(sct$gene))
+  if (is.null(expr)) next
+  expr <- expr %>% dplyr::filter(celltype == ct)
+  
+  # assemble plotting rows: for each timepoint, its 3 states over its top genes
+  pdat <- dplyr::bind_rows(lapply(unique(sct$timepoint), function(tp){
+    g <- sct %>% dplyr::filter(timepoint == tp) %>% dplyr::pull(gene)
+    expr %>% dplyr::filter(gene %in% g,
+                           (Group == "Day0" & Treatment == "CTR") |
+                             (Group == tp     & Treatment == "CTR") |
+                             (Group == tp     & Treatment == "MET")) %>%
+      dplyr::mutate(timepoint = tp,
+                    state = factor(dplyr::case_when(
+                      Group == "Day0"      ~ "Baseline",
+                      Treatment == "CTR"   ~ "Disease",
+                      TRUE                 ~ "Metformin"),
+                      levels = c("Baseline", "Disease", "Metformin")))
+  }))
+  if (!nrow(pdat)) next
+  
+  p <- ggplot(pdat, aes(state, log2cpm, colour = state)) +
+    geom_jitter(width = 0.15, height = 0, size = 1.8, alpha = 0.8) +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.55,
+                 colour = "black", linewidth = 0.3) +
+    facet_grid(timepoint ~ gene, scales = "free_y") +
+    scale_colour_manual(values = c(Baseline = "#4C72B0",
+                                   Disease = "#C44E52",
+                                   Metformin = "#55A868")) +
+    labs(x = NULL, y = "Pseudobulk expression (log2 CPM)",
+         title = paste0("Metformin-reversed genes — ", ct),
+         subtitle = "Points = samples; black bar = mean") +
+    theme_bw(10) +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1),
+          legend.position = "none")
+  
+  n_tp <- length(unique(pdat$timepoint))
+  ggsave(file.path(fig_dir, paste0("reversal_", safe(ct), ".png")),
+         p, width = 2.4 * TOP_N + 1, height = 2.6 * n_tp + 1, dpi = 200)
+}
+
+cat("\nDone. Gene plots in:\n  ", fig_dir, "\n",
+    "Selected genes table: reversal_top_genes.csv\n", sep = "")
+
+
+# Residual normalisation + pathway enrichment of the metformin-reversed program
+
+suppressPackageStartupMessages({ library(dplyr); library(ggplot2) })
+
+## ---- config ----------------------------------------------------------------
+DE_DIR  <- "/Users/mac/Desktop/itegrinmetprev/image analysis/SG/snRNAseq_results/DE"
+out_dir <- dirname(DE_DIR)                       # write alongside DE/
+PADJ <- 0.05; LFC <- 1
+dir.create(file.path(out_dir, "enrichment"), showWarnings = FALSE)
+
+rd <- function(f){
+  p <- file.path(DE_DIR, f)
+  if (!file.exists(p)) return(NULL)
+  read.csv(p, stringsAsFactors = FALSE)
+}
+disease <- rd("DE_disease_Day21_vs_Day0.csv")
+met21   <- rd("DE_metformin_at_Day21.csv")
+resid_c <- rd("DE_vsDay0_Day21_Metformin.csv")   # rigorous residual (if re-run present)
+stopifnot(!is.null(disease), !is.null(met21))
+
+## ======================= (A) RESIDUAL NORMALISATION =========================
+dis <- disease %>% dplyr::select(celltype, gene,
+                                 disease_lfc = log2FoldChange, disease_padj = padj)
+met <- met21  %>% dplyr::select(celltype, gene, met_lfc = log2FoldChange)
+
+dg <- dis %>% dplyr::filter(!is.na(disease_padj), disease_padj < PADJ,
+                            abs(disease_lfc) > LFC) %>%
+  dplyr::left_join(met, by = c("celltype","gene")) %>%
+  dplyr::mutate(met_lfc = ifelse(is.na(met_lfc), 0, met_lfc))
+
+if (!is.null(resid_c)) {
+  ## rigorous: count disease genes STILL different from baseline under metformin
+  rc <- resid_c %>% dplyr::select(celltype, gene,
+                                  resid_lfc = log2FoldChange, resid_padj = padj)
+  res <- dg %>% dplyr::left_join(rc, by = c("celltype","gene")) %>%
+    dplyr::group_by(celltype) %>%
+    dplyr::summarise(n_disease = dplyr::n(),
+                     pct_direction_reversed = 100*mean(sign(met_lfc) != sign(disease_lfc)),
+                     mean_disease_absLFC = mean(abs(disease_lfc)),
+                     mean_residual_absLFC = mean(abs(resid_lfc), na.rm = TRUE),
+                     pct_magnitude_normalized = 100*(1 - mean(abs(resid_lfc), na.rm=TRUE)/mean(abs(disease_lfc))),
+                     n_residual_still_sig = sum(!is.na(resid_padj) & resid_padj < PADJ & abs(resid_lfc) > LFC),
+                     pct_genes_normalized = 100*(1 - sum(!is.na(resid_padj) & resid_padj<PADJ & abs(resid_lfc)>LFC)/dplyr::n()),
+                     .groups = "drop")
+  method <- "rigorous (DayX_Metformin vs Day0 contrast)"
+} else {
+  ## additive estimate: residual_lfc = disease_lfc + metformin_lfc
+  res <- dg %>% dplyr::mutate(resid_lfc = disease_lfc + met_lfc) %>%
+    dplyr::group_by(celltype) %>%
+    dplyr::summarise(n_disease = dplyr::n(),
+                     pct_direction_reversed = 100*mean(sign(met_lfc) != sign(disease_lfc)),
+                     mean_disease_absLFC = mean(abs(disease_lfc)),
+                     mean_residual_absLFC = mean(abs(resid_lfc)),
+                     pct_magnitude_normalized = 100*(1 - mean(abs(resid_lfc))/mean(abs(disease_lfc))),
+                     pct_overshoot = 100*mean(abs(met_lfc) > abs(disease_lfc) & sign(met_lfc)!=sign(disease_lfc)),
+                     .groups = "drop")
+  method <- "additive estimate (disease_lfc + metformin_lfc); re-run pseudobulk for the rigorous version"
+}
+res <- res %>% dplyr::filter(n_disease >= 10) %>%
+  dplyr::arrange(dplyr::desc(pct_magnitude_normalized))
+write.csv(res, file.path(out_dir, "residual_normalization_day21.csv"), row.names = FALSE)
+cat("\n== Residual normalisation at Day21 —", method, "==\n"); print(as.data.frame(res))
+
+# plot: how much disease magnitude metformin removes, per cell type
+ggsave(file.path(out_dir, "fig_residual_normalization.png"),
+       ggplot(res, aes(reorder(celltype, pct_magnitude_normalized),
+                       pct_magnitude_normalized, fill = pct_magnitude_normalized)) +
+         geom_col() + coord_flip() +
+         geom_hline(yintercept = 100, linetype = 2, colour = "grey50") +
+         scale_fill_viridis_c() +
+         labs(x = NULL, y = "% of disease fold-change normalised by metformin (Day21)",
+              title = "Metformin partially restores baseline expression",
+              subtitle = "100% = full return to Day0; direction is ~94% reversed but magnitude only ~40-52%") +
+         theme_bw(11) + theme(legend.position = "none"),
+       width = 8, height = 5, dpi = 200)
+
+## ======================= (B) PATHWAY ENRICHMENT =============================
+# gene set = disease-INDUCED (up in disease) AND metformin-SUPPRESSED (met down)
+# i.e. the programme metformin turns off. Enrich per cell type + pooled core.
+have_cp <- requireNamespace("clusterProfiler", quietly = TRUE) &&
+  requireNamespace("org.Mm.eg.db",   quietly = TRUE)
+cat("\n== enrichment preflight ==\n",
+    "clusterProfiler installed: ", requireNamespace("clusterProfiler", quietly=TRUE), "\n",
+    "org.Mm.eg.db installed   : ", requireNamespace("org.Mm.eg.db",   quietly=TRUE), "\n",
+    "metformin-suppressed genes (total rows): ", nrow(sets <- dg %>%
+                                                        dplyr::filter(disease_lfc > LFC, met_lfc < 0)), "\n",
+    "enrichment output dir    : ", normalizePath(file.path(out_dir, "enrichment")), "\n", sep="")
+if (!have_cp) {
+  message("clusterProfiler / org.Mm.eg.db not installed — skipping enrichment (no plot).\n",
+          "Install: BiocManager::install(c('clusterProfiler','org.Mm.eg.db'))\n",
+          "Gene sets were still written for external tools (e.g. Enrichr).")
+}
+write.csv(sets %>% dplyr::select(celltype, gene, disease_lfc, met_lfc),
+          file.path(out_dir, "enrichment", "metformin_suppressed_geneset.csv"), row.names = FALSE)
+
+if (have_cp) {
+  suppressPackageStartupMessages({ library(clusterProfiler); library(org.Mm.eg.db) })
+  run_go <- function(genes, universe, tag){
+    if (length(genes) < 10) return(NULL)
+    e <- tryCatch(enrichGO(gene = genes, universe = universe, OrgDb = org.Mm.eg.db,
+                           keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05, qvalueCutoff = 0.1, readable = FALSE),
+                  error = function(e) NULL)
+    if (is.null(e) || nrow(as.data.frame(e)) == 0) return(NULL)
+    df <- as.data.frame(e); df$set <- tag; df
+  }
+  # per major cell type (those with a decent suppressed set)
+  major <- sets %>% dplyr::count(celltype) %>% dplyr::filter(n >= 30) %>% dplyr::pull(celltype)
+  all_go <- list()
+  for (ct in major){
+    genes <- sets %>% dplyr::filter(celltype == ct) %>% dplyr::pull(gene) %>% unique()
+    univ  <- disease %>% dplyr::filter(celltype == ct) %>% dplyr::pull(gene) %>% unique()
+    go <- run_go(genes, univ, ct)
+    cat(sprintf("  %-14s genes=%-4d  GO terms=%d\n", ct, length(genes),
+                if (is.null(go)) 0 else nrow(go)))
+    if (!is.null(go)) all_go[[ct]] <- go
+  }
+  # pooled "core" programme: genes suppressed in >= half of cell types
+  core <- sets %>% dplyr::count(gene) %>%
+    dplyr::filter(n >= ceiling(length(unique(sets$celltype))/2)) %>% dplyr::pull(gene)
+  writeLines(core, file.path(out_dir, "enrichment", "core_shared_genes.txt"))
+  univ_all <- unique(disease$gene)
+  core_go <- run_go(core, univ_all, "core_shared")
+  all_go <- c(all_go, list(core_shared = core_go))
+  
+  go_tab <- dplyr::bind_rows(all_go)
+  if (nrow(go_tab)){
+    write.csv(go_tab, file.path(out_dir, "enrichment", "GO_BP_enrichment.csv"), row.names = FALSE)
+    # simple faceted bar of top terms per set (top 8 each)
+    top <- go_tab %>% dplyr::group_by(set) %>%
+      dplyr::slice_min(p.adjust, n = 8, with_ties = FALSE) %>% dplyr::ungroup()
+    ggsave(file.path(out_dir, "enrichment", "fig_GO_top_terms.png"),
+           ggplot(top, aes(reorder(Description, -log10(p.adjust)), -log10(p.adjust))) +
+             geom_col(fill = "#C44E52") + coord_flip() +
+             facet_wrap(~set, scales = "free_y") +
+             labs(x = NULL, y = "-log10 adj.P",
+                  title = "GO-BP enrichment of metformin-suppressed disease genes") +
+             theme_bw(9),
+           width = 13, height = 9, dpi = 200)
+    cat("\nWrote GO_BP_enrichment.csv and fig_GO_top_terms.png (",
+        nrow(go_tab), " terms).\n", sep="")
+    cat("\nTop core-programme GO terms:\n")
+    print(utils::head(go_tab %>% dplyr::filter(set=="core_shared") %>%
+                        dplyr::select(Description, p.adjust, geneID), 10))
+  } else {
+    message("Enrichment ran but returned NO significant GO terms for any set, so no ",
+            "plot was made. Common cause here: the suppressed sets are dominated by ",
+            "poorly-annotated RIKEN/Gm predicted genes. Try loosening thresholds ",
+            "(qvalueCutoff) or enriching the named genes only.")
+  }
+}
+
+cat("\nDone.\n  residual_normalization_day21.csv (+ fig)\n",
+    "  enrichment/metformin_suppressed_geneset.csv\n",
+    "  enrichment/GO_BP_enrichment.csv (+ fig, if clusterProfiler installed)\n", sep="")
+
+
+# mechanism figure + table
+
+suppressPackageStartupMessages({ library(dplyr); library(ggplot2); library(patchwork) })
+
+RES_DIR <- "/Users/mac/Desktop/itegrinmetprev/image analysis/SG/snRNAseq_results"
+GO   <- read.csv(file.path(RES_DIR, "enrichment", "GO_BP_enrichment.csv"), stringsAsFactors = FALSE)
+RES  <- read.csv(file.path(RES_DIR, "residual_normalization_day21.csv"), stringsAsFactors = FALSE)
+out  <- RES_DIR
+
+## ---- 1. reportable pathways table (drop generic terms) ---------------------
+# generic / uninformative GO descriptions to exclude
+generic <- paste0("small gtpase|signal transduction$|regulation of (cellular|protein) ",
+                  "|protein (phosphorylation|localization)|sensory perception|dendrite|synap",
+                  "|brain development|head development|neurotransmitter|axon|^cell migration$",
+                  "|^cell motility$|multicellular organism growth")
+
+report <- GO %>%
+  dplyr::filter(set != "core_shared",
+                p.adjust < 0.05, FoldEnrichment >= 2, Count >= 5,
+                !grepl(generic, Description, ignore.case = TRUE)) %>%
+  dplyr::group_by(set) %>%
+  dplyr::arrange(p.adjust, dplyr::desc(FoldEnrichment), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 5) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(cell_type = set, pathway = Description,
+                   fold_enrichment = round(FoldEnrichment, 1),
+                   padj = signif(p.adjust, 2), n_genes = Count)
+write.csv(report, file.path(out, "reportable_pathways.csv"), row.names = FALSE)
+cat("== reportable pathways (top 5 specific GO-BP per cell type) ==\n")
+print(as.data.frame(report))
+
+## ---- 2a. residual-normalisation panel --------------------------------------
+res <- RES %>% dplyr::filter(n_disease >= 50) %>%     # drop degenerate small-n (vSMCs)
+  dplyr::arrange(pct_magnitude_normalized)
+res$celltype <- factor(res$celltype, levels = res$celltype)
+pA <- ggplot(res, aes(celltype, pct_magnitude_normalized, fill = pct_magnitude_normalized)) +
+  geom_col(width = 0.7) + coord_flip() +
+  geom_text(aes(label = sprintf("%.0f%%", pct_magnitude_normalized)), hjust = -0.15, size = 5) +
+  scale_fill_viridis_c(limits = c(0, 100), guide = "none") +
+  scale_y_continuous(limits = c(0, 100), expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "% disease fold-change normalised",
+       title = "a  Metformin partially restores baseline",
+       subtitle = "direction ~94% reversed; magnitude 38-52%") +
+  theme_bw(15) +
+  theme(plot.title    = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 14),
+        axis.title    = element_text(size = 15),
+        axis.text     = element_text(size = 14))
+
+## ---- 2b. enrichment heatmap (reportable terms x cell type) -----------------
+# use the reportable terms; show -log10 padj where the term is enriched in a type
+hm <- GO %>%
+  dplyr::filter(set != "core_shared", Description %in% report$pathway,
+                p.adjust < 0.05, FoldEnrichment >= 2) %>%
+  dplyr::mutate(neglog10 = -log10(p.adjust))
+# order pathways by how many cell types they appear in, then strength
+ord <- hm %>% dplyr::count(Description, sort = TRUE) %>% dplyr::pull(Description)
+hm$Description <- factor(hm$Description, levels = rev(ord))
+pB <- ggplot(hm, aes(set, Description, fill = neglog10)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "-log10 adj.P") +
+  labs(x = NULL, y = NULL, title = "b  Disease programme suppressed by metformin (per cell type)") +
+  theme_bw(15) +
+  theme(plot.title   = element_text(size = 16, face = "bold"),
+        axis.text.x  = element_text(angle = 30, hjust = 1, size = 14),
+        axis.text.y  = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        legend.text  = element_text(size = 13))
+
+fig <- pA / pB + patchwork::plot_layout(heights = c(1, 2.2))
+ggsave(file.path(out, "fig_mechanism_summary.png"), fig,
+       width = 13, height = 15, dpi = 200)
+
+cat("\nDone.\n  reportable_pathways.csv\n  fig_mechanism_summary.png\n")
