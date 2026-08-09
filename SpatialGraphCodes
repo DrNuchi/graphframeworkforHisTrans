@@ -1,4 +1,4 @@
-Spatial GRAPH analysis of H&E nuclei  (QuPath centroid exports)
+# Spatial GRAPH analysis of H&E nuclei  (QuPath centroid exports)
 
 ## ---- packages --------------------------------------------------------------
 # install.packages(c("data.table","FNN","igraph","deldir","ggplot2","dplyr","tidyr"))
