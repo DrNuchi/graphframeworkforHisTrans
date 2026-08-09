@@ -1,0 +1,131 @@
+# Graph-theoretic model of the snRNA-seq data
+
+suppressPackageStartupMessages({
+  library(Matrix); library(igraph); library(dplyr); library(ggplot2)
+})
+stopifnot(exists("pb"), exists("lut"))
+
+## ---- point this at the imaging distance-to-baseline CSV --------------------
+IMAGING_DIST_CSV <- "/Users/mac/Desktop/itegrinmetprev/image analysis/results_graph/distance_to_baseline.csv"
+out_dir <- if (exists("out_dir")) out_dir else "."
+HVG_N <- 2000; KNN <- 4
+
+# map transcriptomic Subgroup -> imaging condition label
+cond_key <- c(Day0_Control="Day 0", Day14_Control="Day 14",
+              Day14_Metformin="Day 14 metformin",
+              Day21_Control="Day 21", Day21_Metformin="Day 21 metformin")
+
+## ---- 1. per-SAMPLE pseudobulk (collapse cell types) ------------------------
+pbm  <- as.matrix(pb)                              # genes x units (~200 cols)
+samp <- lut$sample
+Msamp <- t(rowsum(t(pbm), samp))                   # genes x sample
+# sample -> Subgroup lookup (each sample belongs to one condition)
+s2c <- lut %>% dplyr::distinct(sample, Subgroup)
+s2c <- s2c[match(colnames(Msamp), s2c$sample), ]
+
+# log2 CPM, then top variable genes
+cpm  <- sweep(Msamp, 2, colSums(Msamp), "/") * 1e6
+lcpm <- log2(cpm + 1)
+v    <- apply(lcpm, 1, var)
+hvg  <- names(sort(v, decreasing = TRUE))[seq_len(min(HVG_N, sum(v > 0)))]
+X    <- lcpm[hvg, ]
+
+## ---- 2. sample-similarity GRAPH (igraph) -----------------------------------
+C <- cor(X)                                        # sample x sample (Pearson)
+n <- ncol(C); adj <- matrix(0, n, n, dimnames = dimnames(C))
+for (i in seq_len(n)) {                            # keep each node's top-KNN edges
+  nb <- order(C[i, ], decreasing = TRUE)[2:(KNN + 1)]
+  adj[i, nb] <- C[i, nb]
+}
+adj <- pmax(adj, t(adj))                           # symmetrise
+g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+V(g)$condition <- as.character(s2c$Subgroup)
+
+# graph community structure: does Day21_Metformin cluster with Day0?
+comm <- cluster_louvain(g, weights = E(g)$weight)
+V(g)$community <- membership(comm)
+comm_tab <- data.frame(sample = V(g)$name, condition = V(g)$condition,
+                       community = V(g)$community)
+write.csv(comm_tab, file.path(out_dir, "transcriptomic_graph_communities.csv"),
+          row.names = FALSE)
+
+# --- diagnostic: does each sample map to exactly ONE Subgroup? ---------------
+chk <- lut %>% dplyr::distinct(sample, Subgroup) %>%
+  dplyr::count(sample, name = "n_subgroups")
+if (any(chk$n_subgroups > 1)) {
+  warning("Some samples map to >1 Subgroup — the sample<->condition key is ambiguous. ",
+          "See sample_subgroup_check.csv.")
+  write.csv(dplyr::filter(dplyr::left_join(lut %>% dplyr::distinct(sample, Subgroup),
+                                           chk, by="sample"), n_subgroups > 1),
+            file.path(out_dir, "sample_subgroup_check.csv"), row.names = FALSE)
+}
+
+# shared, explicit colour map so nodes and legend ALWAYS agree
+cond_levels <- levels(factor(V(g)$condition))
+palette5    <- setNames(
+  c("#E69F00","#D55E00","#009E73","#0072B2","#56B4E9")[seq_along(cond_levels)],
+  cond_levels)
+V(g)$color  <- palette5[V(g)$condition]
+
+# plot the graph
+lay <- layout_with_fr(g)
+png(file.path(out_dir, "fig_transcriptomic_graph.png"), 1400, 1100, res = 200)
+plot(g, layout = lay, vertex.color = V(g)$color,
+     vertex.size = 10, vertex.label.cex = 0.6,
+     edge.width = 1 + 3 * E(g)$weight,
+     main = "Sample-similarity graph (transcriptomic)")
+legend("bottomleft", legend = cond_levels, col = palette5, pch = 19,
+       cex = 0.7, bty = "n")
+dev.off()
+
+## ---- 3. molecular distance-to-baseline per condition -----------------------
+day0 <- colnames(X)[s2c$Subgroup == "Day0_Control"]
+# per-sample distance = 1 - mean correlation to Day0 samples
+samp_dist <- sapply(colnames(X), function(s) 1 - mean(C[s, day0]))
+trans <- data.frame(sample = names(samp_dist),
+                    Subgroup = as.character(s2c$Subgroup),
+                    trans_dist = samp_dist) %>%
+  dplyr::group_by(Subgroup) %>%
+  dplyr::summarise(transcriptomic_dist = mean(trans_dist), .groups = "drop") %>%
+  dplyr::mutate(condition = cond_key[Subgroup])
+
+## ---- 4. DE magnitude per condition (genes changed vs Day0 baseline) --------
+if (exists("de_all") && any(grepl("^vsDay0_", de_all$contrast))) {
+  de_mag <- de_all %>%
+    dplyr::filter(grepl("^vsDay0_", contrast),
+                  !is.na(padj), padj < 0.05, abs(log2FoldChange) > 1) %>%
+    dplyr::mutate(condition = cond_key[sub("^vsDay0_", "", contrast)]) %>%
+    dplyr::count(condition, name = "n_DE_genes")
+} else de_mag <- NULL
+
+## ---- 5. correlate transcriptomic vs imaging distance-to-baseline -----------
+img <- tryCatch(read.csv(IMAGING_DIST_CSV), error = function(e) NULL)
+if (is.null(img)) {
+  message("Imaging CSV not found at IMAGING_DIST_CSV — set the path. ",
+          "Transcriptomic graph + distances were still written.")
+} else {
+  # imaging file has columns: condition, ..., dist_to_baseline
+  img <- img %>% dplyr::select(condition, imaging_dist = dist_to_baseline)
+  integ <- dplyr::inner_join(trans, img, by = "condition")
+  if (!is.null(de_mag)) integ <- dplyr::left_join(integ, de_mag, by = "condition")
+  integ$condition <- factor(integ$condition, levels = unname(cond_key))
+  write.csv(integ, file.path(out_dir, "cross_modal_integration.csv"), row.names = FALSE)
+  
+  rho <- suppressWarnings(cor(integ$transcriptomic_dist, integ$imaging_dist,
+                              method = "spearman"))
+  cat(sprintf("\nSpearman(transcriptomic_dist, imaging_dist) = %.3f  (n = %d conditions)\n",
+              rho, nrow(integ)))
+  print(integ)
+  
+  p <- ggplot(integ, aes(imaging_dist, transcriptomic_dist, label = condition)) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey70", linetype = 2) +
+    geom_point(aes(colour = condition), size = 4) +
+    labs(x = "Imaging spatial distance-to-baseline",
+         y = "Transcriptomic distance-to-baseline",
+         title = "Cross-modal agreement (per condition)",
+         subtitle = sprintf("Spearman rho = %.2f, n = %d", rho, nrow(integ))) +
+    theme_bw(11) + theme(legend.position = "none")
+  p <- if (requireNamespace("ggrepel", quietly = TRUE))
+    p + ggrepel::geom_text_repel(size = 3) else p + geom_text(size = 3, vjust = -0.8)
+  ggsave(file.path(out_dir, "fig_cross_modal.png"), p, width = 6.5, height = 5, dpi = 200)
+}
