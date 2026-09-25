@@ -1,18 +1,14 @@
-###############################################################################
-# SUPPLEMENTARY ANALYSES S1–S5  (append to the END of snRT.R)
+# SUPPLEMENTARY ANALYSES  (append to the END of snRNAseqAnalysis)
 #
-# Run AFTER the pseudobulk block of snRT.R, in the SAME R session, so that
+# Run AFTER the pseudobulk block of snRNAseqAnalysis, in the SAME R session, so that
 # these objects are in memory:  ifnb, pb, lut, de_all, cts, fit_dds,
 #                               out_dir, PADJ, LFC, MIN_REPS_PER_SIDE
-# Quick check before running:   stopifnot(exists("pb"), exists("lut"),
-#                                         exists("de_all"), exists("ifnb"))
-#
+
 # Produces, in <out_dir>/supplementary/ :
-#   S1  within-celltype (composition-adjusted) baseline distance   (R2 #2)
-#   S2  community-coloured sample graph + membership + stability   (R2 #2)
-#   S3  permutation null for the metformin reversal fraction       (R2 #3)
-#   S4  QC / UMAP / marker / provenance from the annotated object  (R1 #2, R2 #1)
-#   S5  segmentation-check & inflammation-score correlation stubs  (R2 #5)
+#   within-celltype (composition-adjusted) baseline distance   
+#   community-coloured sample graph + membership + stability   
+#   permutation null for the metformin reversal fraction       
+#   QC / UMAP / marker / provenance from the annotated object  
 ###############################################################################
 suppressPackageStartupMessages({
   library(Matrix); library(igraph); library(dplyr); library(ggplot2)
@@ -20,12 +16,11 @@ suppressPackageStartupMessages({
 sup_dir <- file.path(out_dir, "supplementary")
 dir.create(sup_dir, showWarnings = FALSE, recursive = TRUE)
 
-## paths / keys used below (define defensively in case only pseudobulk was run)
 if (!exists("cond_key"))
   cond_key <- c(Day0_Control="Day 0", Day14_Control="Day 14",
                 Day14_Metformin="Day 14 metformin",
                 Day21_Control="Day 21", Day21_Metformin="Day 21 metformin")
-# <-- EDIT this to your imaging output if different:
+
 IMAGING_DIST_CSV <- "/Users/mac/Desktop/itegrinmetprev/image analysis/results_graph/distance_to_baseline.csv"
 
 .log2cpm <- function(M){                       # M = genes x samples counts
@@ -37,14 +32,7 @@ IMAGING_DIST_CSV <- "/Users/mac/Desktop/itegrinmetprev/image analysis/results_gr
 }
 
 ###############################################################################
-## S1. Within-cell-type baseline distance (composition-adjusted) — R2 #2
-##  The main-text transcriptomic distance is whole-sample pseudobulk, so the
-##  large composition shift can inflate it. Here the distance is computed
-##  WITHIN each major cell type (per sample), then averaged first within
-##  (condition x cell type) and then across cell types, so abundant cell types
-##  and composition changes do not dominate. If Day21_Metformin is still the
-##  disease condition closest to baseline, the convergence claim is robust to
-##  the composition confound.
+## Within-cell-type baseline distance (composition-adjusted)
 ###############################################################################
 tryCatch({
   base_sg <- "Day0_Control"
@@ -56,7 +44,7 @@ tryCatch({
   rows <- list()
   for (ct in ct_ok) {
     cols <- which(lut$celltype == ct)
-    if (length(cols) < 4) next                 # need a few samples to be meaningful
+    if (length(cols) < 4) next                 
     M  <- pb[, cols, drop = FALSE]
     colnames(M) <- lut$sample[cols]
     sg <- as.character(lut$Subgroup[cols])
@@ -84,7 +72,7 @@ tryCatch({
                      sd = sd(d), n_celltypes = dplyr::n(), .groups = "drop") %>%
     dplyr::mutate(condition = cond_key[Subgroup])
 
-  # compare with the whole-sample distance (from the integration output, if present)
+  # compare with the whole-sample distance 
   ws_path <- file.path(out_dir, "cross_modal_integration.csv")
   if (file.exists(ws_path)) {
     ws <- read.csv(ws_path)[, c("Subgroup","transcriptomic_dist")]
@@ -108,10 +96,7 @@ tryCatch({
 }, error = function(e) message("S1 failed: ", conditionMessage(e)))
 
 ###############################################################################
-## S2. Community-coloured sample-similarity graph + membership + stability — R2 #2
-##  Recolour the sample graph by DETECTED community (not condition) so the
-##  Day21_Metformin membership claim is verifiable, and test stability of the
-##  Day21_Metformin<->Day0 co-clustering across kNN values and seeds.
+## Community-coloured sample-similarity graph + membership + stability
 ###############################################################################
 tryCatch({
   # whole-sample pseudobulk (collapse cell types), log2 CPM, HVGs
@@ -150,7 +135,7 @@ tryCatch({
          pch = 19, cex = 0.7, bty = "n")
   dev.off()
 
-  # stability: does Day21_Metformin share Day0's community? across kNN and seeds
+  # stability
   d0_samp <- s2c$sample[s2c$Subgroup == "Day0_Control"]
   d21m     <- s2c$sample[s2c$Subgroup == "Day21_Metformin"]
   stab <- list()
@@ -168,14 +153,10 @@ tryCatch({
 }, error = function(e) message("S2 failed: ", conditionMessage(e)))
 
 ###############################################################################
-## S3. Permutation null for the metformin reversal fraction — R2 #3
-##  Observed: within Day21, fit ~Treatment (MET vs CTR) per cell type; reversal
-##  fraction = fraction of disease genes moved opposite by metformin. Null:
-##  shuffle Treatment labels among Day21 samples (within cell type), refit,
-##  recompute. Runtime scales with N_PERM x (#cell types) DESeq2 fits.
+## Permutation null for the metformin reversal fraction
 ###############################################################################
 tryCatch({
-  N_PERM <- 200                     # <- runtime knob (200 ~ a few minutes)
+  N_PERM <- 200                    
   # disease gene set + sign, from the existing Day21-vs-Day0 contrast
   dis <- de_all %>% dplyr::filter(contrast == "disease_Day21_vs_Day0",
                                   !is.na(padj), padj < PADJ, abs(log2FoldChange) > LFC) %>%
@@ -237,10 +218,7 @@ tryCatch({
 }, error = function(e) message("S3 failed: ", conditionMessage(e)))
 
 ###############################################################################
-## S4. QC / composition / UMAP / marker evidence / versions — R1 #2, R2 #1
-##  Only what the ANNOTATED object can supply. Upstream provenance (platform,
-##  pre-QC counts, QC thresholds, doublet method, normalization/integration,
-##  reference genome) must be reported from the original processing pipeline.
+## QC / composition / UMAP / marker evidence / versions
 ###############################################################################
 tryCatch({
   md <- ifnb@meta.data
@@ -249,14 +227,14 @@ tryCatch({
             file.path(sup_dir, "S4_nuclei_per_celltype_sample.csv"))
   write.csv(as.data.frame.matrix(table(md$celltype, md$Subgroup)),
             file.path(sup_dir, "S4_nuclei_per_celltype_condition.csv"))
-  # per-cell QC summaries if present
+  # per-cell QC summaries
   qc_cols <- intersect(c("nCount_RNA","nFeature_RNA","percent.mt"), colnames(md))
   if (length(qc_cols))
     write.csv(aggregate(md[qc_cols], list(Sample = md$Sample),
                         function(x) round(c(median = median(x), min = min(x), max = max(x)), 1)),
               file.path(sup_dir, "S4_qc_summary_by_sample.csv"), row.names = FALSE)
 
-  # UMAPs (only if a umap reduction exists)
+  # UMAPs
   if ("umap" %in% names(ifnb@reductions) || "umap" %in% Seurat::Reductions(ifnb)) {
     ggsave(file.path(sup_dir, "S4_umap_celltype.png"),
            Seurat::DimPlot(ifnb, group.by = "celltype", label = TRUE, repel = TRUE) + ggplot2::ggtitle("Cell type"),
@@ -266,7 +244,7 @@ tryCatch({
            width = 8, height = 6, dpi = 200)
   } else message("S4: no 'umap' reduction in object — run RunUMAP() upstream to add S4 UMAPs.")
 
-  # marker evidence DotPlot — EDIT this list to your canonical markers
+  # marker evidence DotPlot
   markers <- c("Tnnt2","Myh6","Actc1",          # cardiomyocytes
                "Pecam1","Cdh5","Vwf",            # endothelium
                "Col1a1","Dcn","Pdgfra",          # fibroblasts
@@ -287,48 +265,3 @@ tryCatch({
       "pre-QC counts, QC thresholds, doublet method, normalization/integration\n",
       "from the ORIGINAL pipeline — these are not recoverable from the annotated object. ==\n", sep="")
 }, error = function(e) message("S4 failed: ", conditionMessage(e)))
-
-###############################################################################
-## S5. Segmentation validation & inflammation-score correlation — R2 #5
-##  These need inputs you create outside R:
-##   (a) manual_counts.csv : columns  image, region(inflamed/quiet), manual, quPath
-##   (b) inflammation_scores.csv : columns  condition, inflammation_score  (blinded)
-##  Place them in <out_dir>/supplementary/ and re-run; both steps auto-skip if absent.
-###############################################################################
-tryCatch({
-  # (a) segmentation vs manual counts
-  mc_path <- file.path(sup_dir, "manual_counts.csv")
-  if (file.exists(mc_path)) {
-    mc <- read.csv(mc_path)
-    r  <- cor(mc$manual, mc$quPath)
-    bias <- mean(mc$quPath - mc$manual)
-    write.csv(data.frame(pearson_r = r, mean_bias = bias, n = nrow(mc)),
-              file.path(sup_dir, "S5_segmentation_validation.csv"), row.names = FALSE)
-    ggplot(mc, aes(manual, quPath, colour = region)) + geom_point(size = 2) +
-      geom_abline(slope = 1, intercept = 0, linetype = 2) +
-      labs(title = sprintf("S5 QuPath vs manual nuclei (r = %.2f)", r)) + theme_bw(12)
-    ggsave(file.path(sup_dir, "S5_segmentation_validation.png"), width = 6, height = 5, dpi = 200)
-    cat(sprintf("\n== S5a segmentation: r = %.2f, mean bias = %.1f ==\n", r, bias))
-  } else message("S5a: manual_counts.csv not found — skipping segmentation validation.")
-
-  # (b) inflammation score vs the two baseline-distances
-  infl_path <- file.path(sup_dir, "inflammation_scores.csv")
-  if (file.exists(infl_path) && file.exists(IMAGING_DIST_CSV)) {
-    infl <- read.csv(infl_path)                                  # condition, inflammation_score
-    img  <- read.csv(IMAGING_DIST_CSV)[, c("condition","dist_to_baseline")]
-    m <- dplyr::inner_join(infl, img, by = "condition")
-    ws_path <- file.path(out_dir, "cross_modal_integration.csv")
-    if (file.exists(ws_path)) {
-      ws <- read.csv(ws_path)[, c("condition","transcriptomic_dist")]
-      m <- dplyr::left_join(m, ws, by = "condition")
-    }
-    rr <- c(spatial  = suppressWarnings(cor(m$inflammation_score, m$dist_to_baseline, method = "spearman")),
-            transcriptomic = if ("transcriptomic_dist" %in% names(m))
-              suppressWarnings(cor(m$inflammation_score, m$transcriptomic_dist, method = "spearman")) else NA)
-    write.csv(m, file.path(sup_dir, "S5_inflammation_vs_distance.csv"), row.names = FALSE)
-    cat("\n== S5b inflammation-score Spearman vs distances ==\n"); print(round(rr, 3))
-  } else message("S5b: inflammation_scores.csv or imaging CSV not found — skipping severity anchor.")
-}, error = function(e) message("S5 failed: ", conditionMessage(e)))
-
-cat("\n==== SUPPLEMENTARY S1–S5 COMPLETE ====\nOutputs in: ", sup_dir, "\n", sep = "")
-###############################################################################
